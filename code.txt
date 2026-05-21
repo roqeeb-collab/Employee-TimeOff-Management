@@ -1,0 +1,585 @@
+// ============================================================
+// TIME-OFF MANAGEMENT SYSTEM — Main Logic
+// ============================================================
+
+const SPREADSHEET_ID = '1A0NRRrW7qVAgKaZh2h1i1VKBHoIEUWY68lqVb-a3sgo';
+const ANNUAL_PTO     = 22;
+
+const COL = {
+  // Employees sheet
+  EMP_EMAIL: 1,
+  EMP_MGR:   2,
+  EMP_BAL:   3,
+
+  // Requests sheet
+  REQ_ID:      1,
+  REQ_EMAIL:   2,
+  REQ_NAME:    3,
+  REQ_START:   4,
+  REQ_END:     5,
+  REQ_DAYS:    6,
+  REQ_NOTES:   7,
+  REQ_STATUS:  8,
+  REQ_COMMENT: 9,
+  REQ_SUBTIME: 10,
+  REQ_DECIDED: 11,
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+function getSheet(name) {
+  return SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(name);
+}
+
+function getEmployeeByEmail(email) {
+  const sheet = getSheet('Employees');
+  const data  = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][COL.EMP_EMAIL - 1].toString().trim().toLowerCase() === email.trim().toLowerCase()) {
+      return { row: i + 1, data: data[i] };
+    }
+  }
+  return null;
+}
+
+function getRequestById(requestId) {
+  const sheet = getSheet('Requests');
+  const data  = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][COL.REQ_ID - 1].toString() === requestId.toString()) {
+      return { row: i + 1, data: data[i] };
+    }
+  }
+  return null;
+}
+
+function generateRequestId() {
+  return 'REQ-' + new Date().getTime();
+}
+
+function formatDate(date) {
+  if (!date) return '';
+  return Utilities.formatDate(new Date(date), Session.getScriptTimeZone(), 'dd MMM yyyy');
+}
+
+function getWebAppUrl() {
+  return 'https://script.google.com/a/macros/getanchor.co/s/AKfycbw5Jl8HqHYryX1eONdH9myVSnhgHHe9EjVvY3Lm7GwIchB8xFvNlX5yOKpvL9YAQ-lmWQ/exec';
+}
+
+// serve() ensures every Web App response renders correctly
+function serve(html) {
+  return HtmlService.createHtmlOutput(html)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ============================================================
+// QA HELPER — sends a rejection email back to the employee
+// with a clear reason and prompts them to resubmit
+// ============================================================
+function rejectSubmission(empEmail, empName, reason) {
+  GmailApp.sendEmail(
+    empEmail,
+    '⚠️ Leave request not submitted — action required',
+    '',
+    {
+      htmlBody: `
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+          <h3 style="color:#e65100">Leave Request Not Processed</h3>
+          <p>Hi ${empName || ''},</p>
+          <p>Your leave request could not be submitted for the following reason:</p>
+          <div style="background:#fff3e0;border-left:4px solid #e65100;padding:12px 16px;margin:16px 0;border-radius:4px">
+            <strong>${reason}</strong>
+          </div>
+          <p>Please resubmit the form with the correct information.</p>
+          <p>If you believe this is an error, please contact HR.</p>
+        </div>`
+    }
+  );
+  Logger.log('Submission rejected for ' + empEmail + ': ' + reason);
+}
+
+// ============================================================
+// WORKING DAYS CALCULATOR
+// Counts weekdays between start and end dates (inclusive)
+// Excludes Nigerian public holidays
+// ============================================================
+function calculateWorkingDays(startDate, endDate) {
+  // Nigerian public holidays — extend this list each year
+  const publicHolidays = [
+    // 2026
+    '2026-01-01', // New Year's Day
+    '2026-01-03', // New Year (observed, if 1st falls on weekend)
+    '2026-03-31', // Eid-el-Fitr (estimated)
+    '2026-04-01', // Eid-el-Fitr (estimated)
+    '2026-04-03', // Good Friday
+    '2026-04-06', // Easter Monday
+    '2026-05-01', // Workers' Day
+    '2026-05-29', // Democracy Day
+    '2026-06-06', // Eid-el-Kabir (estimated)
+    '2026-06-07', // Eid-el-Kabir (estimated)
+    '2026-08-26', // Eid-el-Mawlid (estimated)
+    '2026-10-01', // Independence Day
+    '2026-12-25', // Christmas Day
+    '2026-12-26', // Boxing Day
+    // 2027
+    '2027-01-01', // New Year's Day
+    '2027-03-20', // Eid-el-Fitr (estimated)
+    '2027-03-21', // Eid-el-Fitr (estimated)
+    '2027-03-26', // Good Friday
+    '2027-03-29', // Easter Monday
+    '2027-05-01', // Workers' Day
+    '2027-05-27', // Eid-el-Kabir (estimated)
+    '2027-05-28', // Eid-el-Kabir (estimated)
+    '2027-05-29', // Democracy Day
+    '2027-08-16', // Eid-el-Mawlid (estimated)
+    '2027-10-01', // Independence Day
+    '2027-12-25', // Christmas Day
+    '2027-12-27', // Boxing Day (observed)
+  ];
+
+  const start   = new Date(startDate);
+  const end     = new Date(endDate);
+  const current = new Date(start);
+
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+  current.setHours(0, 0, 0, 0);
+
+  let count = 0;
+  while (current <= end) {
+    const dayOfWeek  = current.getDay();
+    const dateString = Utilities.formatDate(current, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const isWeekend  = dayOfWeek === 0 || dayOfWeek === 6;
+    const isHoliday  = publicHolidays.includes(dateString);
+    if (!isWeekend && !isHoliday) count++;
+    current.setDate(current.getDate() + 1);
+  }
+
+  return count;
+}
+
+// ============================================================
+// QA VALIDATION
+// Returns { valid: true } or { valid: false, reason: '...' }
+// ============================================================
+function validateRequest(empEmail, empName, startDate, endDate, balance) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const start = new Date(startDate);
+  const end   = new Date(endDate);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+
+  // 1. Start date must not be in the past
+  if (start < today) {
+    return {
+      valid: false,
+      reason: 'Your start date (' + formatDate(startDate) + ') is in the past. '
+            + 'Leave requests must be submitted for future dates.'
+    };
+  }
+
+  // 2. End date must not be before start date
+  if (end < start) {
+    return {
+      valid: false,
+      reason: 'Your end date (' + formatDate(endDate) + ') is before your start date '
+            + '(' + formatDate(startDate) + '). Please check your dates and resubmit.'
+    };
+  }
+
+  // 3. Range must not exceed 30 calendar days (single request cap)
+  const calendarDays = Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1;
+  if (calendarDays > 30) {
+    return {
+      valid: false,
+      reason: 'Your requested date range spans ' + calendarDays + ' calendar days. '
+            + 'A single request cannot exceed 30 calendar days. '
+            + 'Please split this into separate requests or contact HR.'
+    };
+  }
+
+  // 4. Working days must be greater than zero
+  const workingDays = calculateWorkingDays(startDate, endDate);
+  if (workingDays <= 0) {
+    return {
+      valid: false,
+      reason: 'Your selected dates (' + formatDate(startDate) + ' to ' + formatDate(endDate) + ') '
+            + 'contain no working days. They may fall entirely on weekends or public holidays. '
+            + 'Please choose different dates.'
+    };
+  }
+
+  // 5. Employee must have sufficient balance
+  if (workingDays > balance) {
+    return {
+      valid: false,
+      reason: 'You have requested ' + workingDays + ' working day(s) but your current leave balance is only '
+            + balance + ' day(s). Please reduce your request or contact HR.'
+    };
+  }
+
+  return { valid: true, days: workingDays };
+}
+
+// ============================================================
+// 1. FORM SUBMIT TRIGGER
+// ============================================================
+function onFormSubmit(e) {
+  try {
+    const values = e.values;
+    // values[0] = Timestamp
+    // values[1] = Employee Email
+    // values[2] = Employee Name
+    // values[3] = Start Date
+    // values[4] = End Date
+    // values[5] = Notes  (Number of Days field has been removed from the form)
+    const empEmail  = values[1].trim();
+    const empName   = values[2].trim();
+    const startDate = values[3];
+    const endDate   = values[4];
+    const notes     = values[5] || '';
+
+    // Check employee exists first so we can address them by name in error emails
+    const employee = getEmployeeByEmail(empEmail);
+    if (!employee) {
+      rejectSubmission(
+        empEmail,
+        empName,
+        'Your email address (' + empEmail + ') was not found in the system. '
+        + 'Please contact HR to ensure your email is registered.'
+      );
+      return;
+    }
+
+    const mgrEmail = employee.data[COL.EMP_MGR - 1];
+    const balance  = employee.data[COL.EMP_BAL - 1];
+
+    // Run all QA checks
+    const validation = validateRequest(empEmail, empName, startDate, endDate, balance);
+    if (!validation.valid) {
+      rejectSubmission(empEmail, empName, validation.reason);
+      return;
+    }
+
+    const days      = validation.days;
+    const reqSheet  = getSheet('Requests');
+    const requestId = generateRequestId();
+
+    reqSheet.appendRow([
+      requestId, empEmail, empName,
+      startDate, endDate, days, notes,
+      'PENDING', '', new Date(), ''
+    ]);
+
+    notifyManager(requestId, empEmail, empName, mgrEmail, startDate, endDate, days, notes, balance);
+
+  } catch (err) {
+    Logger.log('onFormSubmit error: ' + err);
+  }
+}
+
+// ============================================================
+// 2. MANAGER NOTIFICATION EMAIL
+// ============================================================
+function notifyManager(requestId, empEmail, empName, mgrEmail, startDate, endDate, days, notes, balance) {
+  const webAppUrl  = getWebAppUrl();
+  const approveUrl = webAppUrl + '?action=approve&requestId=' + encodeURIComponent(requestId);
+  const rejectUrl  = webAppUrl + '?action=reject&requestId='  + encodeURIComponent(requestId);
+  const subject    = '📋 Leave Request: ' + empName + ' — ' + days + ' day(s)';
+
+  const body = `
+<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <h2 style="color:#333">New Leave Request</h2>
+  <table style="border-collapse:collapse;width:100%">
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Employee</td>
+        <td style="padding:8px;border:1px solid #ddd">${empName} &lt;${empEmail}&gt;</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Start Date</td>
+        <td style="padding:8px;border:1px solid #ddd">${formatDate(startDate)}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">End Date</td>
+        <td style="padding:8px;border:1px solid #ddd">${formatDate(endDate)}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Working Days</td>
+        <td style="padding:8px;border:1px solid #ddd">${days} (auto-calculated, excl. weekends &amp; public holidays)</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Remaining Balance</td>
+        <td style="padding:8px;border:1px solid #ddd">${balance} days</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Notes</td>
+        <td style="padding:8px;border:1px solid #ddd">${notes || 'None'}</td></tr>
+  </table>
+  <br><p>Please action this request:</p>
+  <div style="margin-top:16px">
+    <a href="${approveUrl}" style="background:#34a853;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:15px">✅ Approve</a>
+    &nbsp;&nbsp;
+    <a href="${rejectUrl}" style="background:#ea4335;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:15px">❌ Reject</a>
+  </div>
+  <br><hr>
+  <p style="color:#888;font-size:12px">Request ID: ${requestId}</p>
+</div>`;
+
+  GmailApp.sendEmail(mgrEmail, subject, '', { htmlBody: body });
+  Logger.log('Manager notified: ' + mgrEmail);
+}
+
+// ============================================================
+// 3. WEB APP — APPROVE / REJECT HANDLER
+// ============================================================
+function doGet(e) {
+  const action    = e.parameter.action;
+  const requestId = e.parameter.requestId;
+
+  if (!action || !requestId) return serve('<h3>Invalid request.</h3>');
+
+  if (action === 'approve' || action === 'reject') return showDecisionForm(requestId, action);
+  if (action === 'confirm') return processDecision(e);
+
+  return serve('<h3>Unknown action.</h3>');
+}
+
+function showDecisionForm(requestId, action) {
+  const req = getRequestById(requestId);
+  if (!req) return serve('<h3>Request not found.</h3>');
+
+  if (req.data[COL.REQ_STATUS - 1] !== 'PENDING') {
+    return HtmlService.createHtmlOutput(`
+<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;max-width:500px;margin:60px auto;padding:20px;text-align:center">
+  <div style="font-size:56px">⚠️</div>
+  <h2 style="color:#f57c00">Already Processed</h2>
+  <p>This request has already been <strong>${req.data[COL.REQ_STATUS - 1].toLowerCase()}</strong>.</p>
+  <p style="color:#888;font-size:13px">No changes were made.</p>
+</body></html>`)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  const empEmail  = req.data[COL.REQ_EMAIL - 1];
+  const empName   = req.data[COL.REQ_NAME  - 1];
+  const days      = req.data[COL.REQ_DAYS  - 1];
+  const startDate = formatDate(req.data[COL.REQ_START - 1]);
+  const endDate   = formatDate(req.data[COL.REQ_END   - 1]);
+  const color     = action === 'approve' ? '#34a853' : '#ea4335';
+  const label     = action === 'approve' ? 'Approve'  : 'Reject';
+  const webAppUrl = getWebAppUrl();
+
+  return HtmlService.createHtmlOutput(`
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${label} Leave Request</title>
+  <style>
+    body { font-family:Arial,sans-serif; max-width:500px; margin:40px auto; padding:20px; color:#333; }
+    table { border-collapse:collapse; width:100%; margin:16px 0; }
+    td { padding:10px 12px; border:1px solid #ddd; font-size:14px; }
+    td:first-child { background:#f5f5f5; font-weight:bold; width:40%; }
+    textarea { width:100%; padding:10px; border:1px solid #ccc; border-radius:6px;
+               box-sizing:border-box; font-family:Arial,sans-serif; font-size:14px; resize:vertical; }
+    .btn { background:${color}; color:#fff; padding:12px 28px; border:none;
+           border-radius:6px; font-size:15px; font-weight:bold; cursor:pointer; margin-top:12px; }
+    .btn:hover { opacity:0.9; }
+  </style>
+</head>
+<body>
+  <h2 style="color:${color}">${label} Leave Request</h2>
+  <table>
+    <tr><td>Employee</td><td>${empName} &lt;${empEmail}&gt;</td></tr>
+    <tr><td>Dates</td><td>${startDate} &rarr; ${endDate}</td></tr>
+    <tr><td>Working Days</td><td>${days}</td></tr>
+  </table>
+  <form method="GET" action="${webAppUrl}">
+    <input type="hidden" name="action"    value="confirm">
+    <input type="hidden" name="requestId" value="${requestId}">
+    <input type="hidden" name="decision"  value="${action}">
+    <label style="font-weight:bold;font-size:14px">Comment (optional):</label><br><br>
+    <textarea name="comment" rows="3" placeholder="Add a note for the employee..."></textarea><br>
+    <button type="submit" class="btn">${label} Request</button>
+  </form>
+</body>
+</html>`)
+  .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function processDecision(e) {
+  const requestId = e.parameter.requestId;
+  const decision  = e.parameter.decision;
+  const comment   = e.parameter.comment || '';
+
+  const req = getRequestById(requestId);
+  if (!req) return serve('<h3>Request not found.</h3>');
+
+  const currentStatus = req.data[COL.REQ_STATUS - 1];
+  if (currentStatus !== 'PENDING') {
+    return HtmlService.createHtmlOutput(`
+<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;max-width:500px;margin:60px auto;padding:20px;text-align:center">
+  <div style="font-size:56px">⚠️</div>
+  <h2 style="color:#f57c00">Already Processed</h2>
+  <p>This request has already been <strong>${currentStatus.toLowerCase()}</strong>.</p>
+  <p style="color:#888;font-size:13px">No changes were made.</p>
+</body></html>`)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  const reqSheet = getSheet('Requests');
+  const empEmail = req.data[COL.REQ_EMAIL - 1];
+  const empName  = req.data[COL.REQ_NAME  - 1];
+  const days     = parseInt(req.data[COL.REQ_DAYS - 1], 10);
+  const status   = decision === 'approve' ? 'APPROVED' : 'REJECTED';
+
+  reqSheet.getRange(req.row, COL.REQ_STATUS ).setValue(status);
+  reqSheet.getRange(req.row, COL.REQ_COMMENT).setValue(comment);
+  reqSheet.getRange(req.row, COL.REQ_DECIDED).setValue(new Date());
+
+  if (decision === 'approve') {
+    const employee = getEmployeeByEmail(empEmail);
+    if (employee) {
+      const newBalance = employee.data[COL.EMP_BAL - 1] - days;
+      getSheet('Employees').getRange(employee.row, COL.EMP_BAL).setValue(newBalance);
+    }
+  }
+
+  notifyEmployee(req.data, status, comment);
+
+  const isApproved = decision === 'approve';
+  const emoji      = isApproved ? '✅' : '❌';
+  const color      = isApproved ? '#34a853' : '#ea4335';
+  const heading    = isApproved ? 'Request Approved' : 'Request Rejected';
+  const message    = isApproved
+    ? empName + '\'s leave has been approved. They have been notified by email.'
+    : empName + '\'s leave has been rejected. They have been notified by email.';
+
+  return HtmlService.createHtmlOutput(`
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${heading}</title>
+</head>
+<body style="font-family:Arial,sans-serif;max-width:500px;margin:60px auto;padding:20px;text-align:center">
+  <div style="font-size:64px;margin-bottom:16px">${emoji}</div>
+  <h2 style="color:${color};margin-bottom:8px">${heading}</h2>
+  <p style="font-size:15px;color:#444;margin-bottom:24px">${message}</p>
+  <table style="border-collapse:collapse;width:100%;text-align:left;margin-bottom:24px">
+    <tr>
+      <td style="padding:10px 12px;border:1px solid #ddd;background:#f5f5f5;font-weight:bold;width:40%">Employee</td>
+      <td style="padding:10px 12px;border:1px solid #ddd">${empName}</td>
+    </tr>
+    <tr>
+      <td style="padding:10px 12px;border:1px solid #ddd;background:#f5f5f5;font-weight:bold">Working Days</td>
+      <td style="padding:10px 12px;border:1px solid #ddd">${days}</td>
+    </tr>
+    <tr>
+      <td style="padding:10px 12px;border:1px solid #ddd;background:#f5f5f5;font-weight:bold">Comment</td>
+      <td style="padding:10px 12px;border:1px solid #ddd">${comment || 'None'}</td>
+    </tr>
+  </table>
+  <p style="color:#aaa;font-size:12px">You can close this tab.</p>
+</body>
+</html>`)
+  .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ============================================================
+// 4. EMPLOYEE NOTIFICATION EMAIL
+// ============================================================
+function notifyEmployee(reqData, status, comment) {
+  const empEmail  = reqData[COL.REQ_EMAIL - 1];
+  const empName   = reqData[COL.REQ_NAME  - 1];
+  const days      = reqData[COL.REQ_DAYS  - 1];
+  const startDate = formatDate(reqData[COL.REQ_START - 1]);
+  const endDate   = formatDate(reqData[COL.REQ_END   - 1]);
+
+  const isApproved = status === 'APPROVED';
+  const color      = isApproved ? '#34a853' : '#ea4335';
+  const emoji      = isApproved ? '✅' : '❌';
+  const subject    = emoji + ' Your leave request has been ' + status.toLowerCase();
+
+  const body = `
+<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <h2 style="color:${color}">Leave Request ${status}</h2>
+  <p>Hi ${empName},</p>
+  <p>Your leave request has been <strong>${status.toLowerCase()}</strong>.</p>
+  <table style="border-collapse:collapse;width:100%">
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Dates</td>
+        <td style="padding:8px;border:1px solid #ddd">${startDate} &rarr; ${endDate}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Working Days</td>
+        <td style="padding:8px;border:1px solid #ddd">${days}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold">Manager's comment</td>
+        <td style="padding:8px;border:1px solid #ddd">${comment || 'None'}</td></tr>
+  </table>
+  ${isApproved
+    ? '<p style="margin-top:16px">Your leave balance has been updated. Enjoy your time off! 🌴</p>'
+    : '<p style="margin-top:16px">Please contact your manager if you have questions.</p>'
+  }
+</div>`;
+
+  GmailApp.sendEmail(empEmail, subject, '', { htmlBody: body });
+}
+
+// ============================================================
+// 5. ANNUAL RESET
+// ============================================================
+function resetAnnualLeaveBalances() {
+  const sheet = getSheet('Employees');
+  const data  = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    sheet.getRange(i + 1, COL.EMP_BAL).setValue(ANNUAL_PTO);
+  }
+  const config     = getSheet('Config');
+  const configData = config.getDataRange().getValues();
+  for (let i = 1; i < configData.length; i++) {
+    if (configData[i][0] === 'Last Reset') {
+      config.getRange(i + 1, 2).setValue(new Date());
+    }
+  }
+  Logger.log('Balances reset to ' + ANNUAL_PTO + ' for ' + (data.length - 1) + ' employees.');
+}
+
+// ============================================================
+// 6. TEST HELPERS
+// ============================================================
+function TEST_sendManagerEmail() {
+  notifyManager(
+    'REQ-TEST001',
+    'jane@company.com',
+    'Jane Doe',
+    'manager@company.com',
+    new Date('2026-08-03'),
+    new Date('2026-08-07'),
+    5,
+    'Family holiday',
+    17
+  );
+  Logger.log('TEST: Manager email sent');
+}
+
+function TEST_resetBalances() {
+  resetAnnualLeaveBalances();
+  Logger.log('TEST: Balances reset complete');
+}
+
+function TEST_workingDays() {
+  // Should return 5 (Mon-Fri, no holidays)
+  const days = calculateWorkingDays('2026-08-03', '2026-08-07');
+  Logger.log('TEST: Working days calculated: ' + days + ' (expected 5)');
+}
+
+function TEST_validation() {
+  // Past date — should fail
+  const r1 = validateRequest('a@b.com', 'Test', '2024-01-01', '2024-01-05', 22);
+  Logger.log('Past date test: ' + (r1.valid ? 'FAIL — should have been invalid' : 'PASS — ' + r1.reason));
+
+  // End before start — should fail
+  const r2 = validateRequest('a@b.com', 'Test', '2026-09-10', '2026-09-05', 22);
+  Logger.log('End before start test: ' + (r2.valid ? 'FAIL — should have been invalid' : 'PASS — ' + r2.reason));
+
+  // Insufficient balance — should fail
+  const r3 = validateRequest('a@b.com', 'Test', '2026-08-03', '2026-08-14', 3);
+  Logger.log('Insufficient balance test: ' + (r3.valid ? 'FAIL — should have been invalid' : 'PASS — ' + r3.reason));
+
+  // Valid request — should pass
+  const r4 = validateRequest('a@b.com', 'Test', '2026-08-03', '2026-08-07', 22);
+  Logger.log('Valid request test: ' + (r4.valid ? 'PASS — ' + r4.days + ' days' : 'FAIL — ' + r4.reason));
+}

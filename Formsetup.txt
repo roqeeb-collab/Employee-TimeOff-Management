@@ -1,0 +1,206 @@
+// ============================================================
+// FORM SETUP — Run this ONCE to create and link the Google Form
+// Run AFTER runFullSetup() from Setup.gs
+// ============================================================
+
+function runFormSetup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Create the form
+  const form = FormApp.create('Employee Time-Off Request');
+
+  // ---- Form settings ----
+  form.setDescription(
+    'Submit your leave request below. Your manager will be notified and will approve or reject via email.\n\n' +
+    'Note: Working days are calculated automatically — weekends and public holidays are excluded.'
+  );
+  form.setCollectEmail(false);
+  form.setAllowResponseEdits(false);
+  form.setLimitOneResponsePerUser(false);
+  form.setShowLinkToRespondAgain(true);
+  form.setConfirmationMessage(
+    'Your request has been submitted. You will receive an email confirmation shortly.\n\n' +
+    'If there is an issue with your dates or balance, you will be notified by email.'
+  );
+
+  // ---- Fields (order must match values[] indexes in Code.gs) ----
+
+  // 1. Employee Email — values[1]
+  form.addTextItem()
+    .setTitle('Employee Email')
+    .setHelpText('Enter your work email address. This must match your registered email exactly.')
+    .setRequired(true);
+
+  // 2. Employee Name — values[2]
+  form.addTextItem()
+    .setTitle('Employee Name')
+    .setHelpText('Enter your full name.')
+    .setRequired(true);
+
+  // 3. Start Date — values[3]
+  form.addDateItem()
+    .setTitle('Start Date')
+    .setHelpText('First day of your leave. Must be today or a future date.')
+    .setRequired(true);
+
+  // 4. End Date — values[4]
+  form.addDateItem()
+    .setTitle('End Date')
+    .setHelpText('Last day of your leave. Must be the same as or after your start date.')
+    .setRequired(true);
+
+  // 5. Notes — values[5]
+  // NOTE: Number of Days has been intentionally removed.
+  // Working days are now auto-calculated by the script,
+  // excluding weekends and Nigerian public holidays.
+  form.addParagraphTextItem()
+    .setTitle('Notes')
+    .setHelpText('Optional — add any context for your manager (e.g. reason, cover arrangements).')
+    .setRequired(false);
+
+  // ---- Link form responses to the spreadsheet ----
+  const requestsSheet = ss.getSheetByName('Requests');
+  if (!requestsSheet) {
+    SpreadsheetApp.getUi().alert(
+      '⚠️ Requests sheet not found.\nRun runFullSetup() from Setup.gs first, then re-run this.'
+    );
+    return;
+  }
+
+  // Unlink any existing form first
+  const existingFormUrl = ss.getFormUrl();
+  if (existingFormUrl) {
+    try {
+      FormApp.openByUrl(existingFormUrl).removeDestination();
+    } catch (err) {
+      Logger.log('No existing form to unlink: ' + err);
+    }
+  }
+
+  // Link new form responses to this spreadsheet
+  form.setDestination(FormApp.DestinationType.SPREADSHEET, ss.getId());
+
+  // Save URLs to Config sheet
+  const configSheet = ss.getSheetByName('Config');
+  if (configSheet) {
+    const configData  = configSheet.getDataRange().getValues();
+    let formRowFound  = false;
+    let editRowFound  = false;
+
+    for (let i = 1; i < configData.length; i++) {
+      if (configData[i][0] === 'Form URL') {
+        configSheet.getRange(i + 1, 2).setValue(form.getPublishedUrl());
+        formRowFound = true;
+      }
+      if (configData[i][0] === 'Form Edit URL') {
+        configSheet.getRange(i + 1, 2).setValue(form.getEditUrl());
+        editRowFound = true;
+      }
+    }
+    if (!formRowFound) configSheet.appendRow(['Form URL',      form.getPublishedUrl()]);
+    if (!editRowFound) configSheet.appendRow(['Form Edit URL', form.getEditUrl()]);
+  }
+
+  Logger.log('Form created: '   + form.getPublishedUrl());
+  Logger.log('Form edit URL: '  + form.getEditUrl());
+
+  SpreadsheetApp.getUi().alert(
+    '✅ Form created and linked!\n\n' +
+    '📋 Share this link with employees:\n' +
+    form.getPublishedUrl() + '\n\n' +
+    '📝 Edit the form anytime here:\n' +
+    form.getEditUrl() + '\n\n' +
+    'Form fields (in order):\n' +
+    '  1. Employee Email\n' +
+    '  2. Employee Name\n' +
+    '  3. Start Date\n' +
+    '  4. End Date\n' +
+    '  5. Notes (optional)\n\n' +
+    'Working days are auto-calculated — no "Number of Days" field needed.'
+  );
+}
+
+// ============================================================
+// USE THIS if you already have a form and just want to
+// remove the Number of Days field from it without recreating
+// ============================================================
+function removeNumberOfDaysField() {
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const formUrl = ss.getFormUrl();
+
+  if (!formUrl) {
+    SpreadsheetApp.getUi().alert('No form is linked to this spreadsheet.');
+    return;
+  }
+
+  const form  = FormApp.openByUrl(formUrl);
+  const items = form.getItems();
+  let removed = false;
+
+  for (let i = 0; i < items.length; i++) {
+    const title = items[i].getTitle().toLowerCase();
+    if (title.includes('number of days') || title.includes('days requested') || title.includes('no of days')) {
+      form.deleteItem(items[i]);
+      removed = true;
+      Logger.log('Removed field: ' + items[i].getTitle());
+    }
+  }
+
+  if (removed) {
+    SpreadsheetApp.getUi().alert(
+      '✅ "Number of Days" field removed from the form.\n\n' +
+      'Working days are now auto-calculated by the script.\n\n' +
+      'Confirm your form field order is now:\n' +
+      '  1. Employee Email\n' +
+      '  2. Employee Name\n' +
+      '  3. Start Date\n' +
+      '  4. End Date\n' +
+      '  5. Notes (optional)'
+    );
+  } else {
+    SpreadsheetApp.getUi().alert(
+      'No "Number of Days" field was found on the form.\n' +
+      'It may have already been removed, or the field has a different name.\n\n' +
+      'Open the form editor to verify the field order manually.'
+    );
+  }
+}
+
+// ============================================================
+// UTILITY — Reprint form URLs if you lose them
+// ============================================================
+function printFormUrls() {
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const formUrl = ss.getFormUrl();
+
+  if (!formUrl) {
+    Logger.log('No form is currently linked to this spreadsheet.');
+    return;
+  }
+
+  const form = FormApp.openByUrl(formUrl);
+  Logger.log('Published URL (share with employees): ' + form.getPublishedUrl());
+  Logger.log('Edit URL (for form editor):            ' + form.getEditUrl());
+}
+
+// ============================================================
+// UTILITY — Print current form fields and their order
+// Useful to verify values[] indexes match Code.gs
+// ============================================================
+function printFormFields() {
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const formUrl = ss.getFormUrl();
+
+  if (!formUrl) {
+    Logger.log('No form is currently linked to this spreadsheet.');
+    return;
+  }
+
+  const form  = FormApp.openByUrl(formUrl);
+  const items = form.getItems();
+
+  Logger.log('Form fields (values[] index = position + 1 because values[0] is Timestamp):');
+  items.forEach((item, index) => {
+    Logger.log('  values[' + (index + 1) + '] = ' + item.getTitle());
+  });
+}
