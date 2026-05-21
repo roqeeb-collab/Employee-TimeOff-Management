@@ -231,4 +231,4 @@ Do this each December:
 
 ## License
 
-Internal use only. Built for [Your Company Name].
+Internal use only.
